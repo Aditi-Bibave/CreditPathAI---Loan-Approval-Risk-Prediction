@@ -1,26 +1,32 @@
-# app.py
+# final_UI.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import warnings
 warnings.filterwarnings("ignore")
 
+# ML imports
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import (RandomForestClassifier, ExtraTreesClassifier,
-                              GradientBoostingClassifier)
+from sklearn.ensemble import (
+    RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier
+)
 from sklearn.neighbors import KNeighborsClassifier
 
-# optional xgboost
+# plotting / metrics
+from sklearn.metrics import roc_curve, roc_auc_score, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# optional libs
 try:
     import xgboost as xgb
     XGBOOST_AVAILABLE = True
 except Exception:
     XGBOOST_AVAILABLE = False
 
-# imbalanced-learn (SMOTE)
 try:
     from imblearn.over_sampling import SMOTE
     IMB_AVAILABLE = True
@@ -28,18 +34,120 @@ except Exception:
     IMB_AVAILABLE = False
 
 # -------------------------
-# Helper UI & Utility funcs
+# Utilities (feature building + safe scaling)
 # -------------------------
-def clear_session():
-    for k in ["df", "df_preprocessed", "scaler", "trained_models", "X_columns", "model_features"]:
-        if k in st.session_state:
-            del st.session_state[k]
+def build_feature_row(trained_features, user_values):
+    """
+    Build a 1-row DataFrame aligned exactly to trained_features.
+    user_values: dict of user input values (numbers or strings).
+    Strategy:
+      - Start with zeros for all trained_features.
+      - For numeric user_values: find the best matching numeric column (exact match or token)
+        and fill the number.
+      - For categorical string values: set any trained feature column whose name contains the category token to 1.
+    """
+    X = pd.DataFrame(0, index=[0], columns=trained_features)
+    feat_lows = [c.lower() for c in trained_features]
 
-def load_dataset_from_path(path="loan_dataset/Loan_Default.csv"):
+    for key, val in user_values.items():
+        if val is None:
+            continue
+        key_low = str(key).lower()
+
+        # numeric values
+        if isinstance(val, (int, float, np.integer, np.floating)):
+            placed = False
+            # exact name match
+            for idx, col in enumerate(trained_features):
+                if col.lower() == key_low:
+                    X.iat[0, idx] = val
+                    placed = True
+                    break
+            if placed:
+                continue
+            # token match: place into first numeric-like column that contains the key token
+            for idx, col_low in enumerate(feat_lows):
+                if key_low in col_low and np.issubdtype(X[trained_features[idx]].dtype, np.number):
+                    X.iat[0, idx] = val
+                    placed = True
+                    break
+            # fallback: try columns that include common synonyms
+            if not placed:
+                for synonym in ("amount", "income", "loan", "rate", "score", "value", "term", "ltv", "dtir", "tenure"):
+                    if synonym in key_low:
+                        for idx, col_low in enumerate(feat_lows):
+                            if synonym in col_low and np.issubdtype(X[trained_features[idx]].dtype, np.number):
+                                X.iat[0, idx] = val
+                                placed = True
+                                break
+                    if placed:
+                        break
+            continue
+
+        # string / categorical values
+        if isinstance(val, str):
+            token = val.strip().lower().replace(" ", "_")
+            # mark any trained feature that contains the token
+            for idx, col_low in enumerate(feat_lows):
+                if token in col_low:
+                    X.iat[0, idx] = 1
+            # also mark columns of pattern key_token or token_key
+            for idx, col_low in enumerate(feat_lows):
+                if key_low in col_low and token in col_low:
+                    X.iat[0, idx] = 1
+
+    return X
+
+def safe_scale_row(X_input, scaler, trained_features):
+    """
+    Align X_input to trained_features and scale numeric columns using scaler without causing sklearn feature-name errors.
+    """
+    # Ensure all trained features exist
+    for col in trained_features:
+        if col not in X_input.columns:
+            X_input[col] = 0
+
+    # Keep only trained features (in correct order)
+    X_input = X_input[trained_features].copy()
+
+    if scaler is None:
+        return X_input
+
+    # Determine numeric columns in the aligned X_input
+    numeric_cols = list(X_input.select_dtypes(include=[np.number]).columns)
+
+    # If scaler exposes feature_names_in_, respect that order to avoid mismatch
     try:
-        df_local = pd.read_csv(path)
-        return df_local
-    except Exception as e:
+        feature_names_in = list(scaler.feature_names_in_)
+        # Determine numeric columns expected by scaler that are also present
+        numeric_expected = [c for c in feature_names_in if c in X_input.columns and np.issubdtype(X_input[c].dtype, np.number)]
+        if numeric_expected:
+            X_input[numeric_expected] = scaler.transform(X_input[numeric_expected])
+        else:
+            if numeric_cols:
+                X_input[numeric_cols] = scaler.transform(X_input[numeric_cols])
+    except Exception:
+        # Fallback attempts
+        try:
+            if numeric_cols:
+                X_input[numeric_cols] = scaler.transform(X_input[numeric_cols])
+        except Exception:
+            try:
+                if numeric_cols:
+                    X_input[numeric_cols] = scaler.transform(X_input[numeric_cols].astype(float))
+            except Exception:
+                # last resort: return unscaled (model may still accept it)
+                pass
+
+    return X_input
+
+# -------------------------
+# Small safe helpers for preprocessing
+# -------------------------
+def load_local_dataset(path="loan_dataset/Loan_Default.csv"):
+    try:
+        return pd.read_csv(path)
+    except Exception:
         return None
 
 def safe_get_dummies(df, cat_cols):
@@ -52,107 +160,141 @@ def drop_safe(df, cols):
     return df.drop(columns=[c for c in cols if c in df.columns], errors="ignore")
 
 def clean_colnames(df):
-    df.columns = (df.columns
-                  .str.replace("[", "", regex=False)
+    df.columns = (
+        df.columns.str.replace("[", "", regex=False)
                   .str.replace("]", "", regex=False)
                   .str.replace("<", "", regex=False)
                   .str.replace(">", "", regex=False)
-                  .str.replace(" ", "_", regex=False))
+                  .str.replace(" ", "_", regex=False)
+    )
     return df
 
 # -------------------------
-# App UI
+# UI styling (screenshot-like but professional)
 # -------------------------
 st.set_page_config(page_title="CreditPathAI — Loan Default Predictor", layout="wide")
-st.title("🏦 CreditPathAI — Loan Default Risk Prediction and Recovery Recommendations")
-st.markdown(
-    "Follow steps: **(1)** Provide applicant details, **(2)** Load dataset (from repo or upload), "
-    "**(3)** Preprocess, **(4)** Train/Prepare models, **(5)** Select model & Predict."
-)
-st.write("---")
+st.markdown("""
+<style>
+body { background: #f6f7fb; color: #0b2b35; }
+.header {
+  background: linear-gradient(90deg,#2aa19c,#1976a5);
+  padding:22px;
+  color:white;
+  font-weight:800;
+  font-size:22px;
+  border-radius:12px;
+  text-align:center;
+  margin-bottom:18px;
+}
+.section-title { font-weight:700; color:#07323d; margin-bottom:8px; }
+.card { background:white; padding:18px; border-radius:10px; box-shadow:0 8px 30px rgba(11,43,53,0.06); }
+.result-low { background:#eaf9f2; border-left:6px solid #06a56b; padding:18px; border-radius:8px; color:#056b46; font-weight:700; }
+.result-med { background:#fff8ec; border-left:6px solid #f6a800; padding:18px; border-radius:8px; color:#8a5a00; font-weight:700; }
+.result-high { background:#fff3f3; border-left:6px solid #ff3b3b; padding:18px; border-radius:8px; color:#9b1c1c; font-weight:700; }
+.small-box { background:white; padding:12px; border-radius:10px; text-align:center; box-shadow:0 4px 16px rgba(11,43,53,0.04); }
+.footer { text-align:center; color:#6b7280; padding:12px; margin-top:18px; }
+</style>
+""", unsafe_allow_html=True)
 
-# ==========================
-# Main applicant input area
-# ==========================
-st.subheader("👤 Applicant Details (use these values to test predictions)")
+st.markdown('<div class="header">CREDITPATHAI — LOAN DEFAULT RISK PREDICTION SYSTEM</div>', unsafe_allow_html=True)
 
+# -------------------------
+# Main applicant inputs (top area like screenshot)
+# -------------------------
+st.markdown("### Applicant Example Inputs")
 col1, col2, col3 = st.columns(3)
 with col1:
-    age = st.number_input("Age (Years)", min_value=18, max_value=90, value=30)
-    annual_income = st.number_input("Annual Income (₹)", min_value=0, step=1000, value=300000)
+    age = st.number_input("Age (years)", min_value=18, max_value=90, value=30)
+    gender = st.selectbox("Gender", ["Not specified", "Male", "Female", "Other"])
 with col2:
-    loan_amount = st.number_input("Loan Amount (₹)", min_value=0, step=1000, value=200000)
-    credit_score = st.number_input("Credit Score", min_value=300, max_value=900, value=650)
+    monthly_income = st.number_input("Monthly Income (₹)", min_value=0, step=1000, value=50000)
+    property_value = st.number_input("Property Value (₹)", min_value=0, step=1000, value=1000000)
 with col3:
-    interest_rate = st.slider("Interest Rate (%)", min_value=0.1, max_value=40.0, value=10.0)
-    tenure = st.slider("Loan Tenure (Years)", min_value=1, max_value=60, value=10)
+    loan_amount = st.number_input("Loan Amount (₹)", min_value=0, step=1000, value=300000)
+    interest_rate = st.number_input("Interest Rate (%)", min_value=0.1, max_value=40.0, value=10.0)
 
 st.write("---")
 
-# ==========================
-# Sidebar workflow
-# ==========================
-st.sidebar.title("⚙ Workflow — Data ▶ Preprocess ▶ Models ▶ Predict")
+# -------------------------
+# Sidebar (exact layout A)
+# -------------------------
+st.sidebar.title("Loan Processing Panel")
 
-# 1) Try to load dataset from repo path first (no upload)
-dataset_path = "datasets/Loan_Default.csv"
-df_local = load_dataset_from_path(dataset_path)
+# PERSONAL INFORMATION expander
+with st.sidebar.expander("🧍 Personal Information", expanded=True):
+    gender_sidebar = st.selectbox("Gender", ["Not specified", "Male", "Female", "Other"])
+    credit_worthiness = st.selectbox("Credit Worthiness", ["l1", "l2"])
+    age_bracket = st.selectbox("Age Bracket", ["<25","25-34","35-44","45-54","55-64","65-74",">74"])
+    credit_type = st.selectbox("Credit Type", ["CRIF","EQUI","EXP","Other"])
+    credit_score = st.slider("Credit Score", 300, 900, 650)
+
+# FINANCIAL INFORMATION expander
+with st.sidebar.expander("💰 Financial Information", expanded=True):
+    income = st.number_input("Monthly Income (₹)", min_value=0, step=1000, value=50000, key="inc_sidebar")
+    property_val = st.number_input("Property Value (₹)", min_value=0, step=1000, value=1000000, key="prop_sidebar")
+    dtir1 = st.number_input("Debt-to-Income Ratio (dtir1)", min_value=0.0, max_value=100.0, value=15.0, step=0.1)
+    LTV = st.number_input("Loan-to-Value (%)", min_value=0.0, max_value=100.0, value=40.0, step=0.1)
+
+# LOAN DETAILS expander
+with st.sidebar.expander("📄 Loan Details", expanded=True):
+    loan_type = st.selectbox("Loan Type", ["type1","type2","type3"])
+    approv_in_adv = st.selectbox("Pre-approved?", ["pre","not_pre"])
+    loan_purpose = st.selectbox("Loan Purpose", ["p1","p2","p3","p4"])
+    submission = st.selectbox("Application Submitted To", ["to_inst","not_inst"])
+    loan_amount_sidebar = st.number_input("Loan Amount (₹)", min_value=0, step=1000, value=300000, key="loan_sidebar")
+    rate_of_interest_sidebar = st.number_input("Interest Rate (%)", min_value=0.1, max_value=40.0, value=10.0, step=0.1, key="rate_sidebar")
+    term = st.number_input("Loan Term (months)", min_value=1, max_value=360, value=120, key="term_sidebar")
+
+st.sidebar.markdown("---")
+
+# Dataset load / preview / buttons (always visible)
+dataset_path = "loan_dataset/Loan_Default.csv"
+df_local = load_local_dataset(dataset_path)
 if df_local is not None:
-    st.sidebar.success(f"📄 Loaded dataset from `{dataset_path}` (shape: {df_local.shape})")
+    st.sidebar.success(f"📁 Loaded dataset from `{dataset_path}` ({df_local.shape[0]} rows)")
     st.session_state["df"] = df_local
 else:
-    st.sidebar.info("No local dataset found at `datasets/Loan_Default.csv`.")
-    uploaded = st.sidebar.file_uploader("Or upload a smaller CSV (if your dataset is huge, place it in datasets/)", type=["csv"])
+    st.sidebar.info("No local dataset found. Use uploader below or add file into loan_dataset/")
+    uploaded = st.sidebar.file_uploader("Upload Loan Dataset (.csv)", type=["csv"])
     if uploaded is not None:
-        try:
-            st.session_state["df"] = pd.read_csv(uploaded)
-            st.sidebar.success(f"Uploaded dataset (shape: {st.session_state['df'].shape})")
-        except Exception as e:
-            st.sidebar.error("Could not read uploaded CSV. Error: " + str(e))
+        st.session_state["df"] = pd.read_csv(uploaded)
+        st.sidebar.success("Uploaded dataset")
 
-# show quick dataset preview if available
 if "df" in st.session_state:
     if st.sidebar.checkbox("Preview dataset (first 5 rows)"):
-        st.subheader("📋 Dataset Preview")
+        st.subheader("Dataset preview")
         st.dataframe(st.session_state["df"].head())
 
-# show warning if imblearn not available
-if not IMB_AVAILABLE:
-    st.sidebar.error("`imbalanced-learn` (SMOTE) not installed. Run: pip install imbalanced-learn in this environment.")
-    st.sidebar.markdown("---")
+st.sidebar.markdown("---")
 
-# Model selection (always visible but will be enabled after training)
-# --- Correct Workflow Order ---
-
-# 1️⃣ Preprocess dataset
 preprocess_btn = st.sidebar.button("🔄 Preprocess Dataset")
-
-# 2️⃣ Train models
 train_btn = st.sidebar.button("⚙ Train Models")
-
-# 3️⃣ Choose model
-model_options = ["Select Model", "Logistic Regression", "Decision Tree", "Random Forest",
-                 "Extra Trees", "Gradient Boosting", "KNN"]
+model_options = ["Select Model", "Logistic Regression", "Decision Tree", "Random Forest", "Extra Trees", "Gradient Boosting", "KNN"]
 if XGBOOST_AVAILABLE:
     model_options.append("XGBoost")
+selected_model = st.sidebar.selectbox("Choose Model", model_options)
+predict_btn = st.sidebar.button("🔍 Predict Risk")
 
-selected_model = st.sidebar.selectbox("🤖 Choose Model", model_options)
+st.sidebar.markdown("---")
+st.sidebar.info("Flow: Preprocess → Train → Choose Model → Predict")
 
-# 4️⃣ Predict
-predict_btn = st.sidebar.button("🔍 Predict Default Risk")
+# -------------------------
+# Show dataset top-level info
+# -------------------------
+if "df" in st.session_state and not preprocess_btn and not train_btn:
+    st.write(f"📁 Loaded dataset: {dataset_path}")
+    st.write("Dataset Shape:", st.session_state["df"].shape)
 
-# ==========================
-# Preprocessing logic
-# ==========================
+# -------------------------
+# PREPROCESSING
+# -------------------------
 if preprocess_btn:
     if "df" not in st.session_state:
-        st.error("No dataset available. Upload or place `Loan_Default.csv` into `datasets/`.")
-    elif not IMB_AVAILABLE:
-        st.error("SMOTE not available. Install `imbalanced-learn` to continue.")
+        st.error("No dataset loaded. Upload or place file into loan_dataset/ and reload.")
     else:
         with st.spinner("Preprocessing dataset..."):
-            df = st.session_state["df"].copy()
-            # --- categorical columns (from your notebook) ---
+            dfp = st.session_state["df"].copy()
+            # categorical columns from your notebook
             cat_cols = [
                 "loan_limit","Gender","approv_in_adv","loan_type","loan_purpose",
                 "Credit_Worthiness","open_credit","business_or_commercial",
@@ -161,182 +303,217 @@ if preprocess_btn:
                 "credit_type","co-applicant_credit_type","age",
                 "submission_of_application","Region","Security_Type"
             ]
-            df = safe_get_dummies(df, cat_cols)
-
-            drop_cols = [
-                'ID','loan_limit_ncf','approv_in_adv_pre','loan_type_type2','loan_type_type3',
-                'loan_purpose_p2','loan_purpose_p3','loan_purpose_p4','Credit_Worthiness_l2',
-                'open_credit_opc','business_or_commercial_nob/c','Neg_ammortization_not_neg',
-                'interest_only_not_int','lump_sum_payment_not_lpsm','construction_type_sb',
-                'occupancy_type_pr','occupancy_type_sr','Secured_by_land','total_units_2U',
-                'total_units_3U','total_units_4U','credit_type_CRIF','credit_type_EQUI',
-                'credit_type_EXP','co-applicant_credit_type_EXP','age_35-44','age_45-54',
-                'age_55-64','age_65-74','age_<25','age_>74','submission_of_application_to_inst',
-                'Region_North-East','Region_central','Region_south','Security_Type_direct'
-            ]
-            df = drop_safe(df, drop_cols)
-
-            # ensure TARGET exists
-            TARGET = "Status"
-            if TARGET not in df.columns:
-                st.error(f"Target column `{TARGET}` not found in dataset. Please verify.")
+            dfp = safe_get_dummies(dfp, cat_cols)
+            dfp = drop_safe(dfp, ["ID","year"])
+            # fill numeric missing
+            for c in dfp.select_dtypes(include=[np.number]).columns:
+                dfp[c] = dfp[c].fillna(dfp[c].median())
+            # encode target
+            if "Status" not in dfp.columns:
+                st.error("Target column 'Status' not found in dataset.")
             else:
-                # fill numeric missing with median
-                num_cols = df.select_dtypes(include=["int64","float64"]).columns
-                for c in num_cols:
-                    df[c] = df[c].fillna(df[c].median())
-
-                # label encode target
                 le = LabelEncoder()
-                df[TARGET] = le.fit_transform(df[TARGET].astype(str))
+                dfp["Status"] = le.fit_transform(dfp["Status"].astype(str))
+                dfp = clean_colnames(dfp)
+                st.session_state["df_preprocessed"] = dfp
+                st.success("✅ Preprocessing complete. Now click 'Train Models'.")
 
-                # Save preprocessed df in session
-                st.session_state["df_preprocessed"] = clean_colnames(df)
-                st.success("✅ Preprocessing completed. You can now Train models.")
-
-# ==========================
-# Model training logic
-# ==========================
+# -------------------------
+# TRAINING
+# -------------------------
 if train_btn:
     if "df_preprocessed" not in st.session_state:
-        st.error("Please preprocess the dataset first.")
+        st.error("Please preprocess dataset first.")
     else:
-        df = st.session_state["df_preprocessed"].copy()
-        with st.spinner("Preparing data, scaling and SMOTE..."):
+        with st.spinner("Training models (this may take a few minutes)..."):
+            dfp = st.session_state["df_preprocessed"].copy()
             TARGET = "Status"
-            X = df.drop(columns=[TARGET])
-            y = df[TARGET]
+            X = dfp.drop(columns=[TARGET])
+            y = dfp[TARGET]
 
-            # train/test split (we only need to fit scaler and SMOTE on train)
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42, stratify=y)
+            # train/test split
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
+            # scaling
             scaler = StandardScaler()
             numeric_features = X_train.select_dtypes(include=[np.number]).columns
             X_train[numeric_features] = scaler.fit_transform(X_train[numeric_features])
             X_test[numeric_features] = scaler.transform(X_test[numeric_features])
 
-            # SMOTE (on training)
-            if not IMB_AVAILABLE:
-                st.error("imbalanced-learn (SMOTE) not installed — cannot continue training.")
-            else:
+            # SMOTE if available
+            if IMB_AVAILABLE:
                 sm = SMOTE(random_state=42)
                 X_train_sm, y_train_sm = sm.fit_resample(X_train, y_train)
-                # keep cleaned column names
                 X_train_sm = pd.DataFrame(X_train_sm, columns=X_train.columns)
-                X_test = pd.DataFrame(X_test, columns=X_test.columns)
-
-                # Save scaler and columns to session for predictions
-                st.session_state["scaler"] = scaler
-                st.session_state["X_columns"] = list(X_train_sm.columns)
-
-                # Define models
-                models = {
-                    "Logistic Regression": LogisticRegression(max_iter=2000),
-                    "Decision Tree": DecisionTreeClassifier(),
-                    "Random Forest": RandomForestClassifier(n_estimators=200),
-                    "Extra Trees": ExtraTreesClassifier(n_estimators=200),
-                    "Gradient Boosting": GradientBoostingClassifier(n_estimators=200),
-                    "KNN": KNeighborsClassifier(n_neighbors=5),
-                }
-                if XGBOOST_AVAILABLE:
-                    models["XGBoost"] = xgb.XGBClassifier(eval_metric="logloss", use_label_encoder=False)
-
-                trained = {}
-                for name, mdl in models.items():
-                    with st.spinner(f"Training {name} ..."):
-                        mdl.fit(X_train_sm, y_train_sm)
-                        trained[name] = mdl
-
-                st.session_state["trained_models"] = trained
-                st.session_state["model_features"] = st.session_state["X_columns"]
-                st.success("🔥 All models trained and ready. Choose a model and press Predict.")
-
-# ==========================
-# Prediction logic
-# ==========================
-if predict_btn:
-    # checks
-    if "trained_models" not in st.session_state:
-        st.error("Models not trained yet. Preprocess -> Train first.")
-    else:
-        trained = st.session_state["trained_models"]
-        if selected_model == "Select Model":
-            st.error("Please select a model from the sidebar.")
-        else:
-            model = trained.get(selected_model)
-            if model is None:
-                st.error(f"Model `{selected_model}` not found (maybe training didn't include it).")
             else:
-                # Build input vector aligned to trained columns
-                features = st.session_state.get("model_features", None)
-                if not features:
-                    st.error("No feature list found from training. Re-run training.")
-                else:
-                    # create zero DataFrame with model features
-                    X_input = pd.DataFrame(np.zeros((1, len(features))), columns=features)
+                X_train_sm, y_train_sm = X_train, y_train
 
-                    # map applicant inputs to likely column names if present
-                    mapping = {
-                        "age": age,
-                        "Annual_Income": annual_income,
-                        "Loan_Amt": loan_amount,
-                        "Credit": credit_score,
-                        "Interest": interest_rate,
-                        "Tenure": tenure
-                    }
-                    # attempt to set values for exact matches
-                    for k, v in mapping.items():
-                        if k in X_input.columns:
-                            X_input.loc[0, k] = v
-                        else:
-                            # try lowercase/variants
-                            for col in X_input.columns:
-                                if col.lower() == k.lower() or k.lower() in col.lower():
-                                    X_input.loc[0, col] = v
-                                    break
+            # save scaler and columns
+            st.session_state["scaler"] = scaler
+            st.session_state["model_features"] = list(X_train_sm.columns)
+            st.session_state["X_test"] = X_test
+            st.session_state["y_test"] = y_test
 
-                    # scale numeric cols using stored scaler
-                    scaler = st.session_state.get("scaler", None)
-                    if scaler is not None:
-                        num_cols = X_input.select_dtypes(include=[np.number]).columns.intersection(st.session_state["X_columns"])
-                        try:
-                            X_input[num_cols] = scaler.transform(X_input[num_cols])
-                        except Exception:
-                            # if scaler expects more columns, try filling missing with zeros and transform
-                            pass
+            # define and train models
+            models = {
+                "Logistic Regression": LogisticRegression(max_iter=2000),
+                "Decision Tree": DecisionTreeClassifier(),
+                "Random Forest": RandomForestClassifier(n_estimators=300),
+                "Extra Trees": ExtraTreesClassifier(n_estimators=300),
+                "Gradient Boosting": GradientBoostingClassifier(n_estimators=300),
+                "KNN": KNeighborsClassifier(n_neighbors=5)
+            }
+            if XGBOOST_AVAILABLE:
+                models["XGBoost"] = xgb.XGBClassifier(eval_metric="logloss")
 
-                    # predict
-                    try:
-                        prob = model.predict_proba(X_input)[0][1]
-                        pred = model.predict(X_input)[0]
-                    except Exception as e:
-                        st.error("Prediction failed. The app could not align user inputs to training features. Error: " + str(e))
-                        st.info("Suggestion: Re-check model features or display `model_features` for debugging.")
-                        st.write("Model features count:", len(st.session_state.get("model_features", [])))
-                        st.stop()
+            trained = {}
+            for name, mdl in models.items():
+                mdl.fit(X_train_sm, y_train_sm)
+                trained[name] = mdl
 
-                    # display results
-                    st.subheader("📈 Prediction Result")
-                    pct = prob * 100
-                    if pct >= 70:
-                        st.error(f"🔴 HIGH RISK — Probability of default: {pct:.2f}%")
-                        st.write("Recommendation: Immediate follow-up, legal notice, restructure/settlement options.")
-                    elif pct >= 40:
-                        st.warning(f"🟡 MEDIUM RISK — Probability of default: {pct:.2f}%")
-                        st.write("Recommendation: Frequent reminders, EMI rescheduling, close monitoring.")
-                    else:
-                        st.success(f"🟢 LOW RISK — Probability of default: {pct:.2f}%")
-                        st.write("Recommendation: Approve or monitor normally; consider promotions/discounts.")
+            st.session_state["models"] = trained
+            st.success("🔥 Training complete. Models are ready.")
 
-                    # show probability bar
-                    st.progress(min(100, int(pct)))
-
-# ==========================
-# Developer debug / show trained features
-# ==========================
-with st.expander("Debug / Model Feature Info (for developer)"):
-    if "model_features" in st.session_state:
-        st.write(f"Trained model features ({len(st.session_state['model_features'])}):")
-        st.write(st.session_state["model_features"][:150])
+# -------------------------
+# PREDICTION
+# -------------------------
+if predict_btn:
+    if "models" not in st.session_state:
+        st.error("Train models first (Preprocess → Train).")
+    elif selected_model == "Select Model":
+        st.error("Please select a model.")
     else:
-        st.write("Model features not available yet. Preprocess & Train first.")
+        model = st.session_state["models"][selected_model]
+        features = st.session_state["model_features"]
+        scaler = st.session_state.get("scaler", None)
+
+        st.info("🔍 Building input → Aligning features → Scaling → Predicting...")
+
+        # build mapping of UI -> expected dataset tokens (keep names used in dataset)
+        user_values = {
+            "age": age,
+            "Gender": gender_sidebar if 'gender_sidebar' in st.session_state else gender,
+            "Credit_Worthiness": credit_worthiness,
+            "credit_type": credit_type,
+            "Credit_Score": credit_score,
+            "income": income,
+            "property_value": property_val,
+            "dtir1": dtir1,
+            "LTV": LTV,
+            "loan_type": loan_type,
+            "approv_in_adv": approv_in_adv,
+            "loan_purpose": loan_purpose,
+            "submission_of_application": submission,
+            "loan_amount": loan_amount_sidebar if 'loan_amount_sidebar' in st.session_state else loan_amount,
+            "rate_of_interest": rate_of_interest_sidebar if 'rate_of_interest_sidebar' in st.session_state else interest_rate,
+            "term": term
+        }
+
+        # Build exact feature row (no guessed columns)
+        X_input = build_feature_row(features, user_values)
+
+        # Align and scale safely
+        X_scaled = safe_scale_row(X_input.copy(), scaler, features)
+
+        # Predict probability
+        try:
+            prob = float(model.predict_proba(X_scaled)[0][1]) * 100
+        except Exception:
+            # if model has no predict_proba, fallback to predict
+            try:
+                pred = model.predict(X_scaled)[0]
+                prob = 100.0 if pred == 1 else 0.0
+            except Exception as e:
+                st.error("Prediction failed: " + str(e))
+                prob = 0.0
+
+        non_prob = 100 - prob
+        conf = max(prob, non_prob)
+
+        # Result banner/cards (screenshot-like)
+        if prob < 40:
+            st.markdown(f'<div class="result-low">🟢 LOW DEFAULT RISK — {prob:.2f}%</div>', unsafe_allow_html=True)
+        elif prob < 70:
+            st.markdown(f'<div class="result-med">🟡 MEDIUM DEFAULT RISK — {prob:.2f}%</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="result-high">🔴 HIGH DEFAULT RISK — {prob:.2f}%</div>', unsafe_allow_html=True)
+
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f'<div class="small-box">Default<br><span style="color:#d93737;font-size:18px">{prob:.2f}%</span></div>', unsafe_allow_html=True)
+        c2.markdown(f'<div class="small-box">Non-Default<br><span style="color:#0fa958;font-size:18px">{non_prob:.2f}%</span></div>', unsafe_allow_html=True)
+        c3.markdown(f'<div class="small-box">Model Confidence<br><span style="color:#0b3b4a;font-size:18px">{conf:.2f}%</span></div>', unsafe_allow_html=True)
+
+        st.progress(min(100, int(conf)))
+
+        # Recommendations text
+        if prob >= 70:
+            st.warning("Recommendation: Immediate follow-up, restructure or legal remedies.")
+        elif prob >= 40:
+            st.info("Recommendation: Monitoring, EMI rescheduling, frequent reminders.")
+        else:
+            st.success("Recommendation: Low risk — approve or monitor normally.")
+
+        # ROC and Confusion Matrix using held-out test set
+        st.markdown("### Model Evaluation (held-out test set)")
+        X_test = st.session_state.get("X_test", None)
+        y_test = st.session_state.get("y_test", None)
+
+        if X_test is not None and y_test is not None:
+            try:
+                # ensure X_test has same columns as features (scaler/transform consistency)
+                X_test_aligned = X_test.copy()
+                missing_cols = [c for c in features if c not in X_test_aligned.columns]
+                for c in missing_cols:
+                    X_test_aligned[c] = 0
+                X_test_aligned = X_test_aligned[features]
+
+                # Some models require scaling the test set already done during training path.
+                # If scaler was used, X_test is already scaled during training step.
+
+                y_prob = model.predict_proba(X_test_aligned)[:, 1]
+                auc_score = roc_auc_score(y_test, y_prob)
+                fpr, tpr, _ = roc_curve(y_test, y_prob)
+                st.markdown(f"**ROC Curve (AUC = {auc_score:.3f})**")
+                fig = plt.figure(figsize=(6,4))
+                plt.plot(fpr, tpr, label=f"AUC={auc_score:.3f}")
+                plt.plot([0,1], [0,1], 'k--')
+                plt.xlabel("False Positive Rate")
+                plt.ylabel("True Positive Rate")
+                plt.legend()
+                st.pyplot(fig)
+                plt.close(fig)
+            except Exception as e:
+                st.info("ROC not available for this model or an error occurred: " + str(e))
+
+            try:
+                preds = model.predict(X_test_aligned)
+                cm = confusion_matrix(y_test, preds)
+                st.markdown("**Confusion Matrix**")
+                fig2 = plt.figure(figsize=(4,3))
+                sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+                plt.xlabel("Predicted")
+                plt.ylabel("Actual")
+                st.pyplot(fig2)
+                plt.close(fig2)
+            except Exception as e:
+                st.info("Confusion matrix not available: " + str(e))
+        else:
+            st.info("No test set available (train models first).")
+
+# -------------------------
+# Developer info & footer
+# -------------------------
+with st.expander("Developer Info — session keys & feature list"):
+    st.write("Session keys:", list(st.session_state.keys()))
+    if "model_features" in st.session_state:
+        st.write("Model features count:", len(st.session_state["model_features"]))
+        st.write("Model features (first 300):")
+        st.write(st.session_state["model_features"][:300])
+    if "scaler" in st.session_state:
+        try:
+            st.write("scaler.feature_names_in_:")
+            st.write(list(st.session_state["scaler"].feature_names_in_))
+        except Exception:
+            st.write("scaler.feature_names_in_ not available in this scaler.")
+
+st.markdown('<div class="footer">© 2025 CreditPathAI. All rights reserved.</div>', unsafe_allow_html=True)
